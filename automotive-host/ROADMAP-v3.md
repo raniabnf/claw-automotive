@@ -1,6 +1,6 @@
 # Automotive Host Roadmap
 
-Last updated: 2026-05-04
+Last updated: 2026-05-05
 Review cycle: ROADMAP v3 — incorporates peer review feedback on v2.
 
 ## Purpose
@@ -16,6 +16,8 @@ This document is the internal source of truth for:
 - the acceptance criteria for each phase
 - the numbered backlog with priority, status, and commit traceability
 - the failure taxonomy and recovery contracts
+- the **domain lexicon**, **diagnostic taxonomy**, and **standards traceability**
+  rules (anti-divergence versus OEM tools)
 - the integration contract with `claw-code`
 
 This roadmap applies only to `automotive-host/`.
@@ -681,6 +683,53 @@ churn breaks safety-critical domain rules (contradicts ADR-010).
 - alignment with ADR-009/010: operations stay canonical; interpretation stays
   host-owned or host-loaded
 
+### ADR-012: Normative lexicon, diagnostic taxonomy, and OEM non-divergence
+
+**Context.** Free-form naming in code, JSON, and catalogs drifts from what
+technicians see in manufacturer tools, breaks golden tests, and causes agents
+to argue with the workshop screen. At the same time, purely mirroring vendor
+strings loses interoperability across adapters.
+
+**Decision.**
+
+- **Three-layer terminology model** (mandatory for every classified domain
+  value):
+  1. **Vendor surface** — exactly what the tool showed or emitted (lossless
+     within UTF-8; Unicode NFC for text; no « helpfully fixed » spelling).
+  2. **Host canonical** — stable English `snake_case` identifiers in Rust, JSON
+     keys, and event names (this roadmap + `operations.rs` are normative).
+  3. **Standards reference** — where a value maps onto a published code set,
+     cite the norm (`SAE J2012`, `ISO 15031-6`, `ISO 14229-1`, etc.) in
+     metadata, not only in prose.
+
+- **DTC handling** follows the **dual representation** rule:
+  - `code_canonical` is produced only by the **published normalization
+    algorithm** in the section *Domain lexicon, diagnostic taxonomy, and
+    reliability contracts* / *DTC taxonomy* (same input → same output until
+    `taxonomy_schema_version` bumps).
+  - `vendor_code_text` (or equivalent) retains the tool-native string whenever
+    it differs from canonical or when disambiguation is required.
+
+- **No silent OEM mismatch.** If generic text is shown to the operator, it must
+  be traceable to `(catalog_id, catalog_version, code_canonical)` or flagged as
+  `interpretation_provisional`. Host code must not invent manufacturer meanings
+  for proprietary sub-components.
+
+- **Taxonomy evolution is versioned.** Any change to prefix rules, status-bit
+  interpretation, or ECU identity fields increments `taxonomy_schema_version` and
+  triggers migration notes; CI holds golden vectors fixed per version.
+
+- **Reliability linkage.** Ambiguity is a **typed outcome** (`mapping_unknown`,
+  `standard_partial`) with recovery hints — never a best-effort guess that
+  downstream treats as fact.
+
+**Consequences.**
+
+- reviewers can trace any displayed DTC back to vendor text + standard or
+  catalog line
+- adapters may differ; the **contract** stays stable
+- playbook (`ADR-011`) and taxonomy versions compose explicitly in manifests
+
 ## Product Principles
 
 1. **Own the process tree.**
@@ -731,6 +780,12 @@ churn breaks safety-critical domain rules (contradicts ADR-010).
 13. **Independence from claw internals.**
     Internal types are owned by automotive-host. The bridge maps to claw's
     schema at the transport boundary. Core domain survives claw fork changes.
+
+14. **Lexicon and taxonomy are contractual.**
+    Domain terms, DTC normalization, and ECU identity rules are versioned
+    (`taxonomy_schema_version`) and tested with golden vectors. Adapters store
+    vendor truth alongside host-canonical fields — never one without the other
+    when they differ (`ADR-012`).
 
 ## V1 Execution Scope
 
@@ -788,6 +843,153 @@ Interpretation rule:
 - a procedure may invoke the same operation as one step among several, but does
   not redefine the public meaning of `diag.read_dtcs`
 
+## Domain lexicon, diagnostic taxonomy, and reliability contracts
+
+*Normative companion to **ADR-011** (playbooks) and **ADR-012** (non-divergence).
+Implementation ships with a frozen `taxonomy_schema_version` integer; any
+semantic change to normalization, bit meanings, or mandatory fields increments
+that version and requires migration notes plus updated golden fixtures.*
+
+### Objectives
+
+1. **OEM fidelity** — A technician can compare host output to the vendor tool:
+   host-canonical fields never replace vendor strings; they sit beside them.
+2. **Cross-adapter reasoning** — Merging sessions or bindings across tool
+   families relies on `code_canonical` + `code_kind` + ECU address, not on a
+   localized vendor UI label alone.
+3. **Maximum reliability** — Same input → same output; ambiguity is typed, not
+   silently "best-effort"; audit evidence is always traceable.
+
+### Three representation layers (see ADR-012)
+
+| Layer | Role | Example |
+|-------|------|---------|
+| Vendor surface | Screen truth / tool-reported string | `"P0240 - Supercharging Air Cooler"` |
+| Host canonical | Stable API / JSON identifiers | `code_kind`, `code_canonical`, `dtc_id` |
+| Standards reference | Map onto a published code set | `standard_ref: Iso14229Dtc`, `Iso15031J2012` |
+
+Operator-facing descriptions come from the **catalog**
+(`catalog_id`, `catalog_version`) or are flagged `interpretation_provisional`.
+
+### Core lexicon (minimum set, English host identifiers)
+
+Public keys stay **English `snake_case`**; localized UI belongs in clients.
+Mandatory host terms — do not overload these with ad hoc synonyms in code:
+
+| Host term | Definition | Anti-drift notes |
+|-----------|------------|------------------|
+| `dtc` | Logical "diagnostic trouble code" unit | Do not publish a Rust type named `fault`; reserve that wording for UI copy. |
+| `dtc_record` | Typed row returned by `diag.read_dtcs` | Always includes provenance fields (below). |
+| `mil` | MIL / OBD indicator state when exposed | Do not equate with the phrase "check engine" alone. |
+| `ecu` | Diagnosed control unit | `ecu_display_name` = vendor surface; `ecu_address` / `ecu_canonical_id` = host. |
+| `session` | Supervised automotive session | Scope: link, vehicle, audit trace. |
+| `capture` | Raw serial file or byte stream | Sealed as immutable; parser output is derived, not authoritative over bytes. |
+| `procedure` | Governed workflow (steps, approvals) | Not a bare `diag.*` operation. |
+
+Lexicon extensions ship with a **glossary changelog** (semver); no new transport
+synonyms without an explicit update to this roadmap section.
+
+### DTC taxonomy (normative)
+
+**Target standards (by reference — do not embed full normative tables here)**
+
+- **SAE J2012** / **ISO 15031-6** — letter family + seven hex digits (e.g.
+  `P0420`) for the familiar OBD-II presentation on generic tools.
+- **ISO 14229-1 (UDS)** — 24-bit DTC plus **DTC status byte** (test failed,
+  pending, confirmed, etc.); OEM tools may omit `P`/`U` prefixes or reorder byte
+  presentation.
+
+**`DtcRecord` — mandatory fields (V1 contractual)**
+
+| Field | Logical type | Rule |
+|-------|----------------|------|
+| `taxonomy_schema_version` | `u16` | Same for an entire `diag.read_dtcs` response; defines semantics of sibling fields. |
+| `code_kind` | enum | `obd_j2012` \| `uds_triplet` \| `vendor_opaque` \| `unknown` |
+| `code_canonical` | string | **Only** the output of the normalization function for this taxonomy version. |
+| `vendor_code_text` | optional string | Empty only when the vendor string was already identical to canonical form; otherwise **must** retain the source string. |
+| `standard_ref` | optional enum | `Iso15031J2012`, `Iso14229Dtc`, `none` — set when binding/capture supports it. |
+| `dtc_status_byte` | optional `u8` | Present only when authenticated from UDS/capture; **never** fabricated from GUI alone. |
+| `mapping_confidence` | enum | `confirmed_by_wire` \| `confirmed_by_ui` \| `inferred` \| `unknown` |
+| `ecu_address` | optional struct | Logical/physical addressing **as supplied by the binding**; no guessing outside a known protocol. |
+| `catalog_gloss_id` | optional string | Stable id in the text catalog (ADR-011); avoid long prose in the raw record when avoidable. |
+
+**Normalization algorithm v1 (`taxonomy_schema_version == 1`)**
+
+Input: `vendor_code_text` after Unicode **trim** + **NFC**. Output:
+(`code_kind`, `code_canonical`, `mapping_confidence`).
+
+1. **OBD/J2012-shaped** — After removing internal hyphens/spaces and an optional
+   leading `DTC` token, apply checks **in order**:
+   - **Primary (ISO 15031-6 / SAE J2012 display, 5 characters):** if the
+     string (case-insensitive) matches `[PCBU][0-3][0-9A-Fa-f]{3}`, then
+     `code_kind = obd_j2012`, `code_canonical` = **uppercase** 5-character form
+     (`P0420`, `B1003`), `mapping_confidence = confirmed_by_ui` (promote to
+     `confirmed_by_wire` when serial capture agrees).
+   - **Extended display (some OEM / aftermarket tools, 8 characters):** else
+     if it matches `[PCBU][0-9A-Fa-f]{7}`, treat as tool-specific extended
+     presentation, same `code_kind`, `code_canonical` = uppercase letter + seven
+     uppercase hex digits (documented as **non-primary** path in golden
+     fixtures).
+   Leading spaces or padding are forbidden; `p0420` → `P0420`.
+
+2. **UDS triplet** — When the binding supplies three DTC bytes from a classified
+   frame (not from OCR), `code_kind = uds_triplet`, `code_canonical` =
+   `0x` + six **uppercase** hex digits (**big-endian** order of the three DTC
+   octets as documented for that vehicle/stack in the binding). Populate
+   `vendor_code_text` when the tool shows a different presentation.
+
+3. **Vendor opaque** — Unclassified strings (proprietary alphanumeric codes,
+   labels without stable hex): `code_kind = vendor_opaque`,
+   `code_canonical = NFC(trim(source))`, `mapping_confidence = unknown` until a
+   catalog rule or capture upgrades it.
+
+4. **UI vs wire conflict** — When GUI and capture disagree on code identity,
+   emit **two** records or one with `mapping_confidence = unknown` **and** an
+   audit event `diagnostic_surface_mismatch` (see `events.rs`) — never silently
+   overwrite.
+
+**DTC status (UDS)** — Decode `dtc_status_byte` per the **ISO 14229 revision**
+pinned by the taxonomy version; OEM use of reserved bits stays
+`vendor_extension` plus raw capture.
+
+### ECU identity and vehicle context
+
+- **`ecu_display_name`** — Tool-reported string; not canonical alone.
+- **`ecu_canonical_id`** — Stable host identifier (deterministic hash of
+  normalized tuples **or** catalog id); defined in `types/ecu.rs`.
+- **VIN / CalID** — Source is mandatory (`mode_09`, `uds_readDataById`, …);
+  never conflate with on-screen labels without evidence of origin.
+
+### Operational reliability and optimization
+
+- **Determinism** — Normalization is pure (no I/O); property tests enforce
+  idempotency: `normalize(normalize(x)) == normalize(x)`.
+- **Golden vectors** — `tests/fixtures/dtc_normalization_v1/*.json`: input →
+  expected (`code_kind`, `code_canonical`, confidence); CI fails on drift.
+- **Bounded work** — `read_dtcs` uses a session **timeout** + maximum list
+  cardinality (soft guard against pathological giant OEM lists).
+- **Idempotency** — Same `session_id` + same read-only op may be retried
+  without side effects; duplicate suppression uses optional **session-scoped**
+  short-TTL cache, not opaque global mutable state.
+- **Observability** — Each `diag.read_dtcs` response carries
+  `taxonomy_schema_version` and, where applicable, `parser_build_id` /
+  `host_version` in state for post-mortem correlation (OpenTelemetry-style
+  stable attributes on tool spans).
+
+### Catalog and manifest coupling
+
+Every catalog pack declares at minimum:
+
+```text
+taxonomy_schema_version
+catalog_semver
+operations_wire_version
+compat_host_version_range
+```
+
+Host vs catalog `taxonomy_schema_version` mismatch = **typed load error** — no
+partial silent merge.
+
 ## Module Responsibilities
 
 ```
@@ -823,7 +1025,7 @@ src/
 │   ├── lexia.rs                — placeholder
 │   └── xentry.rs               — placeholder
 └── types/
-    ├── dtc.rs                  — DtcRecord, DtcStatus, DtcSeverity
+    ├── dtc.rs                  — DtcRecord (vendor + canonical fields), code_kind, normalize_dtc v1
     ├── ecu.rs                  — EcuDescriptor, EcuIdentity
     ├── vehicle.rs              — VehicleIdentity, VinRecord
     ├── live_data.rs            — LiveDataFrame, PidRequest, PidValue
@@ -943,6 +1145,15 @@ Implement the platform-neutral contracts first:
   - `RecoveryStrategy`
   - mapping boundary from adapter-local failure to public failure
 
+- `src/types/dtc.rs` (or equivalent module path)
+  - `DtcRecord` with mandatory provenance fields per *Domain lexicon* /
+    *DTC taxonomy* (`taxonomy_schema_version`, `code_kind`, `code_canonical`,
+    `vendor_code_text`, `mapping_confidence`, …)
+  - pure `normalize_dtc_code_v1` + unit/property tests; golden fixtures under
+    `tests/fixtures/dtc_normalization_v1/`
+  - wire round-trip tests: sample JSON fixtures must match the public
+    `diag.read_dtcs` response contract
+
 - `src/state.rs` or bridge-owned `AutomotiveState`
   - state snapshot serialized to `.claw/automotive-state.json`
   - status, current operation, last failure, session id, health, capture state
@@ -956,6 +1167,8 @@ Implement the platform-neutral contracts first:
 Acceptance:
 - every public operation has one canonical string and one internal variant
 - `diag.read_dtcs` parses to exactly one internal operation
+- DTC normalization v1 golden vectors pass under CI; `taxonomy_schema_version`
+  is present on every `DtcRecord` in fixture outputs
 - every request/response/event/failure/state shape round-trips through JSON
 - malformed input returns typed JSON error and does not panic
 - adapter-local failure kinds cannot serialize as public transport failures
