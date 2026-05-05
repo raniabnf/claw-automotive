@@ -3,6 +3,8 @@
 Last updated: 2026-05-05
 Review cycle: ROADMAP v3 — incorporates peer review feedback on v2.
 
+<!-- markdownlint-disable MD060 --><!-- tables are valid CommonMark; spacing rule is noisy for wide spec columns -->
+
 ## Purpose
 
 `automotive-host` is the domain system for automotive diagnosis,
@@ -140,10 +142,12 @@ cleanup, or crash recovery.
   vehicle through the same adapter.
 
 - **State machine.** Explicit lifecycle states:
-  ```
+
+  ```text
   Idle → Launching → Attached → LinkSearching → LinkEstablished →
   Operating → Blocked → Failed → Shutdown
   ```
+
   Every state transition is logged and emitted as an internal event.
 
 - **Heartbeat / watchdog.** Periodic check (configurable, default 2s):
@@ -264,7 +268,7 @@ strategies.
 
 **Decision.** `AutomotiveFailureKind` enum with 14 failure classes:
 
-```
+```text
 // Process supervision
 supervisor_launch_failed      — binary not found, hash mismatch, or spawn error
 supervisor_process_died       — process exited unexpectedly
@@ -289,6 +293,7 @@ audit_write_failure           — audit record could not be persisted
 ```
 
 Each class maps to a `RecoveryStrategy`:
+
 - `Retry { max_attempts, backoff_ms }`
 - `RestartAdapter`
 - `Escalate`
@@ -891,7 +896,7 @@ synonyms without an explicit update to this roadmap section.
 
 ### DTC taxonomy (normative)
 
-**Target standards (by reference — do not embed full normative tables here)**
+#### Target standards (by reference — do not embed full normative tables here)
 
 - **SAE J2012** / **ISO 15031-6** — letter family + seven hex digits (e.g.
   `P0420`) for the familiar OBD-II presentation on generic tools.
@@ -992,7 +997,7 @@ partial silent merge.
 
 ## Module Responsibilities
 
-```
+```text
 src/
 ├── main.rs                     — binary entrypoint, stdio JSON-line protocol
 ├── supervisor.rs               — ProcessSupervisor, Job Object, heartbeat, locks
@@ -1165,6 +1170,7 @@ Implement the platform-neutral contracts first:
   - guarantees that invalid action/payload combinations cannot enter runtime
 
 Acceptance:
+
 - every public operation has one canonical string and one internal variant
 - `diag.read_dtcs` parses to exactly one internal operation
 - DTC normalization v1 golden vectors pass under CI; `taxonomy_schema_version`
@@ -1217,6 +1223,7 @@ Implement a deterministic broker/runtime skeleton without Op-Com:
     classes, never swallowed silently
 
 Acceptance:
+
 - broker reads multiple JSON-lines requests and writes correlated responses
 - `cancel` for an in-flight mock operation produces a typed cancellation event
 - state file updates after session start, operation start, failure, completion,
@@ -1273,6 +1280,7 @@ Dependencies: `win32job = "2"` (MIT), `windows` crate for `SendMessageTimeoutW`,
 `CreateMutexW`, process enumeration.
 
 Acceptance:
+
 - if automotive-host is killed (`taskkill /F`), a supervised test child process
   dies within 1 second
 - two simultaneous `spawn()` calls for the same COM port → second returns
@@ -1312,6 +1320,7 @@ pub enum AutomotiveEvent {
 All events carry a `timestamp: DateTime<Utc>` and a `session_id: Option<String>`.
 
 Acceptance:
+
 - every event variant serializes to JSON and deserializes without loss
 - events are independent of claw types — no claw imports in `events.rs`
 - test: `all_event_variants_round_trip_json`
@@ -1353,7 +1362,7 @@ State file format:
 
 stdin/stdout protocol (JSON-lines):
 
-```
+```text
 → {"type":"request","id":"req-1","op":"diag.read_dtcs","params":{"ecu":"engine"}}
 → {"type":"cancel","id":"req-2"}
 ← {"type":"response","id":"req-1","ok":true,"result":{"dtcs":[...]}}
@@ -1365,6 +1374,7 @@ stdin/stdout protocol (JSON-lines):
 ```
 
 Acceptance:
+
 - bridge mapping function is a pure function with no side effects
 - state file is valid JSON at every write (atomic rename)
 - stdin/stdout protocol handles malformed input gracefully (returns error
@@ -1397,6 +1407,7 @@ Implement `src/failure.rs`:
   boundary; they must never leak as competing top-level taxonomies
 
 Acceptance:
+
 - every failure class has a default recovery strategy
 - test: `all_failure_kinds_display_and_serialize`
 - test: `failure_with_nested_cause_preserves_chain`
@@ -1412,6 +1423,7 @@ Acceptance:
 - `unsafe_code = "forbid"` enforced (already in Cargo.toml)
 
 Acceptance:
+
 - CI runs on every push to `main` and on every PR
 - CI blocks merge on any failure
 
@@ -1456,6 +1468,7 @@ Discovery note:
   diagnostic software; VM use is discovery-only
 
 Acceptance:
+
 - every control used in automation has a documented access strategy
 - the document is reviewed against a live Op-Com session
 
@@ -1476,6 +1489,7 @@ Each control wrapper tries UIA first, falls back to Win32, logs which
 strategy succeeded.
 
 Acceptance:
+
 - integration test against Notepad validates the infrastructure
 - `wait_for_element()` returns `adapter_timeout` after deadline
 - unexpected dialogs → `adapter_dialog_blocked` with dialog title and text
@@ -1491,6 +1505,7 @@ Implement `opcom.rs` `discover()` + `launch()` using the supervisor:
   detect initial connection state
 
 Acceptance:
+
 - launch creates Op-Com inside Job Object — killing automotive-host
   kills Op-Com
 - missing install → `supervisor_launch_failed` with path checked
@@ -1507,6 +1522,7 @@ Implement `detect_obd_link()`:
   `Error`
 
 Acceptance:
+
 - test: `obd_status_string_mapping` (unit, pattern matching)
 
 #### H1.5 — Canonical `diag.read_dtcs` end-to-end (Op-Com binding)
@@ -1517,6 +1533,7 @@ triggers DTC read, extracts the ListView, and returns normalized
 `Vec<DtcRecord>`.
 
 Acceptance:
+
 - empty DTC list → `Ok(vec![])`, not an error
 - response shape is vendor-neutral `Vec<DtcRecord>` with no Op-Com-specific
   transport fields
@@ -1555,6 +1572,7 @@ Implement `src/traffic_interception/mod.rs`:
   acceptance belongs to automotive-host's own bridge implementation
 
 Acceptance:
+
 - test: `com0com_detection_structured_result`
 - deliverable: `docs/com0com-setup.md` with compatibility matrix and approved
   installer metadata
@@ -1583,6 +1601,7 @@ Implement `src/traffic_interception/relay.rs`:
 - latency budget: < 1ms per relay
 
 Acceptance:
+
 - Op-Com works identically through the bridge
 - every byte is captured with microsecond timestamp
 - FTDI disconnect or interception failure → typed
@@ -1603,6 +1622,7 @@ Implement `src/traffic_interception/parser.rs`:
 - developed iteratively against captured data from H2.2
 
 Acceptance:
+
 - test: `parse_captured_dtc_read_fixture`
 - test: `partial_frame_reassembly`
 - test: `checksum_error_produces_protocol_error_not_crash`
@@ -1614,6 +1634,7 @@ interception
 (capture live data stream) + subscription API.
 
 Acceptance:
+
 - claw can subscribe to PIDs, receive filtered frames
 - `.claw/automotive-state.json` updated with latest values
 - OBD link loss → `vehicle_comm_lost`
@@ -1644,6 +1665,7 @@ Status: blocked by H3
 Priority: P2
 
 #### H4.1 — Procedure definitions (YAML + validation)
+
 #### H4.2 — Policy engine (ReadOnly / WriteVehicle / FlashEcu / CodingChange)
 
 ### Horizon 5 — Controlled Write Operations
