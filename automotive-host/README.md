@@ -12,7 +12,7 @@ It is a Windows-first, same-machine automotive execution host that owns:
 
 - process supervision for vendor diagnostic software
 - UI Automation and Win32 fallback control paths
-- serial proxying and raw traffic capture
+- **diagnostic traffic interception** — virtual COM / relay, raw capture, parsers
 - typed automotive sessions and audit trails
 - policy, approvals, and procedures for risky actions
 - a thin bridge for `claw` orchestration
@@ -34,6 +34,7 @@ The canonical direction is:
 
 - `supervisor` — process ownership, Job Object, heartbeat, emergency stop
 - `host` — request routing and runtime dispatch
+- `types` — stable cross-adapter contracts (`DtcRecord`, taxonomy helpers)
 - `schemas` — typed request/response envelopes
 - `events` — internal automotive event model
 - `failure` — typed failure taxonomy and recovery mapping
@@ -41,7 +42,7 @@ The canonical direction is:
 - `policy` — zero-trust evaluation rules
 - `procedures` — deterministic procedure definitions
 - `audit` — append-only evidence and operation trail
-- `serial_proxy` — raw capture, relay, and parser layers
+- **diagnostic traffic interception** — raw capture, relay, and parser layers
 - `ui_automation` — UIA helpers and Win32 fallback
 - `adapters` — per-software isolation: Op-Com first, others later
 - `bridge` — mapping to `claw` transport/state surfaces
@@ -60,11 +61,12 @@ The canonical direction is:
 ```bash
 cd automotive-host
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
 ## Documentation
 
 - `ROADMAP-v3.md` — canonical detailed roadmap, ADRs, backlog, and acceptance criteria
 - `AGENTS.md` — engineering rules for agents working in this crate
+- `DEVELOPING.md` — module boundaries, DTC versioning, branching notes for fork integration

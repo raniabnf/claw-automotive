@@ -201,12 +201,6 @@ fn phases_for(operation: AdapterOperation) -> Vec<AdapterPhase> {
             AdapterPhase::Navigate,
             AdapterPhase::ExportReport,
         ],
-        AdapterOperation::ExecuteWrite | AdapterOperation::VerifyPostAction => vec![
-            AdapterPhase::Launch,
-            AdapterPhase::AttachInterface,
-            AdapterPhase::Navigate,
-            AdapterPhase::Extract,
-        ],
         _ => vec![
             AdapterPhase::Launch,
             AdapterPhase::AttachInterface,

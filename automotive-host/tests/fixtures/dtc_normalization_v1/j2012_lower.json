@@ -1,0 +1,6 @@
+{
+  "input": "p0420",
+  "expected_kind": "obd_j2012",
+  "expected_canonical": "P0420",
+  "expected_confidence": "confirmed_by_ui"
+}

@@ -1,0 +1,6 @@
+{
+  "input": "dtc C0301",
+  "expected_kind": "obd_j2012",
+  "expected_canonical": "C0301",
+  "expected_confidence": "confirmed_by_ui"
+}

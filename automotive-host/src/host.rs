@@ -104,15 +104,16 @@ impl AutomotiveHostAgent {
         }
 
         let module = match request.action {
-            OperationName::LaunchTool | OperationName::DispatchAdapterOperation => "adapters",
-            OperationName::StartSession
-            | OperationName::AttachTool
-            | OperationName::CloseSession => "sessions",
-            OperationName::ReadFaults
+            OperationName::LaunchTool
+            | OperationName::DispatchAdapterOperation
+            | OperationName::ReadFaults
             | OperationName::ReadDtcs
             | OperationName::ReadLiveData
             | OperationName::DiscoverVehicle
             | OperationName::IdentifyEcu => "adapters",
+            OperationName::StartSession
+            | OperationName::AttachTool
+            | OperationName::CloseSession => "sessions",
             OperationName::LoadProcedure | OperationName::SimulateProcedure => "procedures",
             OperationName::ExecuteApprovedAction | OperationName::ExecuteWrite => "policy",
             OperationName::VerifySession | OperationName::VerifyPostAction => "verify",

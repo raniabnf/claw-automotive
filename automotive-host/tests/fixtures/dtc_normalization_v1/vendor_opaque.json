@@ -1,0 +1,6 @@
+{
+  "input": " OEM-SPEC-99 ",
+  "expected_kind": "vendor_opaque",
+  "expected_canonical": "OEM-SPEC-99",
+  "expected_confidence": "unknown"
+}

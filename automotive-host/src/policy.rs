@@ -18,6 +18,7 @@ pub struct OperatorContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // Policy inputs mirror procedural checklist until H0 refactor
 pub struct ActionRequestContext {
     pub action_class: ActionClass,
     pub adapter_connected: bool,

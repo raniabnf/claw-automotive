@@ -15,6 +15,7 @@ pub struct OpComAdapter {
 
 impl OpComAdapter {
     #[must_use]
+    #[allow(clippy::too_many_lines)] // Descriptor bootstrap; split when Op-Com binding grows
     pub fn new(windows_version: WindowsVersion) -> Self {
         let suffix = match windows_version {
             WindowsVersion::Win7 => "win7",
