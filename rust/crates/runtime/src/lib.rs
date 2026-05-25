@@ -39,6 +39,7 @@ mod report_schema;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod trident;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;

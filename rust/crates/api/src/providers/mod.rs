@@ -234,7 +234,7 @@ pub fn resolve_model_alias(model: &str) -> String {
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
-    if canonical.starts_with("claude") {
+    if canonical.starts_with("claude") || canonical.starts_with("anthropic/") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
             auth_env: "ANTHROPIC_API_KEY",
@@ -639,6 +639,14 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
+        }),
+        "qwen-max" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
+        }),
+        "qwen-plus" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            context_window_tokens: 131_072,
         }),
         _ => None,
     }

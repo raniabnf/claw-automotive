@@ -1,7 +1,22 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Process-lifetime set of already-emitted config deprecation warning strings.
+/// Prevents duplicate warnings when `ConfigLoader::load()` is called multiple
+/// times within a single CLI invocation. (ROADMAP #698)
+static EMITTED_CONFIG_WARNINGS: std::sync::OnceLock<Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn emit_config_warning_once(warning: &str) {
+    let set = EMITTED_CONFIG_WARNINGS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.insert(warning.to_string()) {
+        eprintln!("warning: {warning}");
+    }
+}
 
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
@@ -90,6 +105,10 @@ pub struct RuntimePermissionRuleConfig {
     allow: Vec<String>,
     deny: Vec<String>,
     ask: Vec<String>,
+    /// #159: simple tool-name denials parsed from the `deniedTools` config field.
+    /// Unlike the `deny` rules (pattern-based), `denied_tools` is a flat list of
+    /// tool names that are unconditionally denied regardless of permission mode.
+    denied_tools: Vec<String>,
 }
 
 /// Collection of configured MCP servers after scope-aware merging.
@@ -297,7 +316,7 @@ impl ConfigLoader {
         }
 
         for warning in &all_warnings {
-            eprintln!("warning: {warning}");
+            emit_config_warning_once(&warning.to_string());
         }
 
         let merged_value = JsonValue::Object(merged.clone());
@@ -592,6 +611,104 @@ pub fn default_config_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claw"))
 }
 
+/// Save provider settings to the user-level `~/.claw/settings.json`.
+/// Creates the file and directory if they don't exist. Sets file permissions
+/// to `0o600` (owner read/write only) to protect stored API keys.
+pub fn save_user_provider_settings(
+    kind: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
+    let settings_path = config_home.join("settings.json");
+
+    let mut root = read_settings_root(&settings_path);
+
+    let mut provider = serde_json::Map::new();
+    provider.insert(
+        "kind".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    provider.insert(
+        "apiKey".to_string(),
+        serde_json::Value::String(api_key.to_string()),
+    );
+    if let Some(base_url) = base_url {
+        provider.insert(
+            "baseUrl".to_string(),
+            serde_json::Value::String(base_url.to_string()),
+        );
+    } else {
+        provider.remove("baseUrl");
+    }
+    root.insert("provider".to_string(), serde_json::Value::Object(provider));
+    if let Some(model) = model {
+        root.insert(
+            "model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    } else {
+        root.remove("model");
+    }
+
+    write_settings_root(&settings_path, &root)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&settings_path, perms).map_err(ConfigError::Io)?;
+    }
+
+    Ok(())
+}
+
+/// Remove the `provider` section from the user-level `~/.claw/settings.json`.
+pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    let settings_path = config_home.join("settings.json");
+
+    if !settings_path.exists() {
+        return Ok(());
+    }
+
+    let mut root = read_settings_root(&settings_path);
+    if root.remove("provider").is_none() {
+        return Ok(());
+    }
+    root.remove("model");
+
+    write_settings_root(&settings_path, &root)?;
+
+    Ok(())
+}
+
+fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    match fs::read_to_string(path) {
+        Ok(contents) if !contents.trim().is_empty() => {
+            serde_json::from_str::<serde_json::Value>(&contents)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default()
+        }
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn write_settings_root(
+    path: &Path,
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(ConfigError::Io)?;
+    }
+    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root.clone()))
+        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    fs::write(path, format!("{rendered}\n")).map_err(ConfigError::Io)
+}
+
 impl RuntimeHookConfig {
     #[must_use]
     pub fn new(
@@ -640,8 +757,18 @@ impl RuntimeHookConfig {
 
 impl RuntimePermissionRuleConfig {
     #[must_use]
-    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
-        Self { allow, deny, ask }
+    pub fn new(
+        allow: Vec<String>,
+        deny: Vec<String>,
+        ask: Vec<String>,
+        denied_tools: Vec<String>,
+    ) -> Self {
+        Self {
+            allow,
+            deny,
+            ask,
+            denied_tools,
+        }
     }
 
     #[must_use]
@@ -657,6 +784,11 @@ impl RuntimePermissionRuleConfig {
     #[must_use]
     pub fn ask(&self) -> &[String] {
         &self.ask
+    }
+
+    #[must_use]
+    pub fn denied_tools(&self) -> &[String] {
+        &self.denied_tools
     }
 }
 
@@ -828,6 +960,12 @@ fn parse_optional_permission_rules(
             .unwrap_or_default(),
         ask: optional_string_array(permissions, "ask", "merged settings.permissions")?
             .unwrap_or_default(),
+        denied_tools: optional_string_array(
+            permissions,
+            "deniedTools",
+            "merged settings.permissions",
+        )?
+        .unwrap_or_default(),
     })
 }
 
