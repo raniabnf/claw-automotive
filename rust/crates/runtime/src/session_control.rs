@@ -28,7 +28,8 @@ pub struct SessionStore {
 impl SessionStore {
     /// Build a store from the server's current working directory.
     ///
-    /// The on-disk layout becomes `<cwd>/.claw/sessions/<workspace_hash>/`.
+    /// The on-disk layout is `<cwd>/.claw/sessions/<workspace_hash>/`,
+    /// created lazily on first successful session save.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
         // #151: canonicalize so equivalent paths (symlinks, relative vs
@@ -40,7 +41,6 @@ impl SessionStore {
             .join(".claw")
             .join("sessions")
             .join(workspace_fingerprint(&canonical_cwd));
-        fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
             workspace_root: canonical_cwd,
@@ -49,7 +49,8 @@ impl SessionStore {
 
     /// Build a store from an explicit `--data-dir` flag.
     ///
-    /// The on-disk layout becomes `<data_dir>/sessions/<workspace_hash>/`
+    /// The on-disk layout is `<data_dir>/sessions/<workspace_hash>/`,
+    /// created lazily on first successful session save.
     /// where `<workspace_hash>` is derived from `workspace_root`.
     pub fn from_data_dir(
         data_dir: impl AsRef<Path>,
@@ -64,7 +65,6 @@ impl SessionStore {
             .as_ref()
             .join("sessions")
             .join(workspace_fingerprint(&canonical_workspace));
-        fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
             workspace_root: canonical_workspace,
@@ -93,8 +93,19 @@ impl SessionStore {
     }
 
     pub fn resolve_reference(&self, reference: &str) -> Result<SessionHandle, SessionControlError> {
+        self.resolve_reference_excluding(reference, None)
+    }
+
+    /// Resolve a session reference, optionally excluding a session by ID.
+    /// When the reference is an alias, the excluded session is skipped
+    /// so /resume latest returns the previous session, not the current one.
+    pub fn resolve_reference_excluding(
+        &self,
+        reference: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<SessionHandle, SessionControlError> {
         if is_session_reference_alias(reference) {
-            let latest = self.latest_session()?;
+            let latest = self.latest_session_excluding(exclude_id)?;
             return Ok(SessionHandle {
                 id: latest.id,
                 path: latest.path,
@@ -158,11 +169,44 @@ impl SessionStore {
     }
 
     pub fn latest_session(&self) -> Result<ManagedSessionSummary, SessionControlError> {
-        if let Some(latest) = self.list_sessions()?.into_iter().next() {
+        self.latest_session_excluding(None)
+    }
+
+    /// Find the most recent session, optionally excluding a session by ID
+    /// and skipping sessions with 0 messages. Used by /resume latest to skip
+    /// the current empty session and find the previous session with actual
+    /// conversation history.
+    pub fn latest_session_excluding(
+        &self,
+        exclude_id: Option<&str>,
+    ) -> Result<ManagedSessionSummary, SessionControlError> {
+        let exclude = exclude_id.unwrap_or("");
+        // First: look in the current workspace's session namespace
+        if let Some(latest) = self
+            .list_sessions()?
+            .into_iter()
+            .find(|s| s.id != exclude && s.message_count > 0)
+        {
             return Ok(latest);
         }
-        if let Some(latest) = self.scan_global_sessions()?.into_iter().next() {
+        // Fallback: scan all workspace namespaces under ~/.claw/sessions/
+        // and project-local .claw/sessions/ so /resume latest finds sessions
+        // from other workspaces.
+        if let Some(latest) = self
+            .scan_global_sessions()?
+            .into_iter()
+            .find(|s| s.id != exclude && s.message_count > 0)
+        {
             return Ok(latest);
+        }
+        // Distinguish between "no sessions at all" and "sessions exist but
+        // all are empty" so the user gets a clear signal about what to do.
+        let has_any_session = self.list_sessions()?.iter().any(|s| s.id != exclude)
+            || self.scan_global_sessions()?.iter().any(|s| s.id != exclude);
+        if has_any_session {
+            return Err(SessionControlError::Format(format_all_sessions_empty(
+                &self.sessions_root,
+            )));
         }
         Err(SessionControlError::Format(format_no_managed_sessions(
             &self.sessions_root,
@@ -204,28 +248,41 @@ impl SessionStore {
         &self,
         reference: &str,
     ) -> Result<LoadedManagedSession, SessionControlError> {
-        match self.load_session(reference) {
-            Ok(loaded) => Ok(loaded),
-            Err(SessionControlError::WorkspaceMismatch { expected, actual })
-                if is_session_reference_alias(reference) =>
+        self.load_session_excluding(reference, None)
+    }
+
+    /// Like `load_session_loose` but also excludes a session by ID.
+    /// Used by /resume latest to skip the current empty session and find
+    /// the previous session with actual conversation history.
+    pub fn load_session_excluding(
+        &self,
+        reference: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<LoadedManagedSession, SessionControlError> {
+        let handle = self.resolve_reference_excluding(reference, exclude_id)?;
+        let session = Session::load_from_path(&handle.path)?;
+        // For alias references, allow cross-workspace resume
+        if is_session_reference_alias(reference) {
+            if let Err(SessionControlError::WorkspaceMismatch {
+                expected: _,
+                actual,
+            }) = self.validate_loaded_session(&handle.path, &session)
             {
-                let handle = self.resolve_reference(reference)?;
-                let session = Session::load_from_path(&handle.path)?;
                 eprintln!(
                     "  Note: resuming session from a different workspace (origin: {})",
                     actual.display()
                 );
-                let _ = expected; // suppress unused warning
-                Ok(LoadedManagedSession {
-                    handle: SessionHandle {
-                        id: session.session_id.clone(),
-                        path: handle.path,
-                    },
-                    session,
-                })
             }
-            Err(other) => Err(other),
+        } else {
+            self.validate_loaded_session(&handle.path, &session)?;
         }
+        Ok(LoadedManagedSession {
+            handle: SessionHandle {
+                id: session.session_id.clone(),
+                path: handle.path,
+            },
+            session,
+        })
     }
 
     pub fn fork_session(
@@ -726,6 +783,16 @@ fn format_no_managed_sessions(sessions_root: &Path) -> String {
     )
 }
 
+fn format_all_sessions_empty(sessions_root: &Path) -> String {
+    let fingerprint_dir = sessions_root
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("<unknown>");
+    format!(
+        "all sessions are empty (0 messages) in .claw/sessions/{fingerprint_dir}/\nThis usually means a fresh `claw` session is running but no messages have been sent yet.\nWait for a response in your other session, then try `--resume {LATEST_SESSION_REFERENCE}` again."
+    )
+}
+
 fn format_legacy_session_missing_workspace_root(
     session_path: &Path,
     workspace_root: &Path,
@@ -760,14 +827,43 @@ mod tests {
     use crate::session::Session;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("runtime-session-control-{nanos}"))
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "runtime-session-control-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
     }
 
     fn persist_session(root: &Path, text: &str) -> Session {
@@ -982,6 +1078,38 @@ mod tests {
     }
 
     #[test]
+    fn session_store_from_cwd_is_side_effect_free_until_save() {
+        // given
+        let base = temp_dir();
+        let workspace = base.join("fresh-workspace");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        // when
+        let store = SessionStore::from_cwd(&workspace).expect("store should build");
+
+        // then — resolving the store must not create .claw/session partitions.
+        assert!(
+            !workspace.join(".claw").exists(),
+            "session store construction must not create .claw side effects"
+        );
+        assert!(
+            !store.sessions_dir().exists(),
+            "session partition should be created lazily on save"
+        );
+
+        let session = persist_session_via_store(&store, "first saved turn");
+        assert!(
+            store
+                .sessions_dir()
+                .join(format!("{}.jsonl", session.session_id))
+                .exists(),
+            "saving a managed session should create the lazy session partition"
+        );
+
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
     fn session_store_from_cwd_isolates_sessions_by_workspace() {
         // given
         let base = temp_dir();
@@ -1178,6 +1306,117 @@ mod tests {
         // then
         assert_eq!(latest.id, newer.session_id);
         assert_eq!(handle.id, newer.session_id);
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn latest_session_returns_all_empty_error_when_sessions_exist_but_have_no_messages() {
+        // given — create sessions with 0 messages (empty)
+        let _env_guard = crate::test_env_lock();
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let isolated_config_home = base.join("config-home");
+        let _claw_config_home = EnvVarGuard::set("CLAW_CONFIG_HOME", &isolated_config_home);
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+
+        let empty_handle = store.create_handle("empty-session");
+        Session::new()
+            .with_persistence_path(empty_handle.path.clone())
+            .save_to_path(&empty_handle.path)
+            .expect("empty session should save");
+
+        // when — latest_session should fail with the "all sessions empty" message
+        let result = store.latest_session();
+        assert!(
+            result.is_err(),
+            "latest_session should fail when all sessions are empty"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("all sessions are empty"),
+            "error should mention 'all sessions are empty', got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("0 messages"),
+            "error should mention '0 messages', got: {err_msg}"
+        );
+
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn latest_session_excluding_skips_excluded_id_and_returns_previous() {
+        // given — two sessions WITH messages, newest excluded
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let older = persist_session_via_store(&store, "older work");
+        wait_for_next_millisecond();
+        let newer = persist_session_via_store(&store, "newer work");
+
+        // when — exclude the newest session
+        let latest = store
+            .latest_session_excluding(Some(&newer.session_id))
+            .expect("latest excluding newest should resolve");
+
+        // then — the older session wins because the newest is skipped
+        assert_eq!(
+            latest.id, older.session_id,
+            "excluded id must be skipped, returning the previous session"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn latest_session_filters_out_zero_message_sessions() {
+        // given — one empty (0-message) session and one non-empty session
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+
+        let empty_handle = store.create_handle("empty-session");
+        Session::new()
+            .with_persistence_path(empty_handle.path.clone())
+            .save_to_path(&empty_handle.path)
+            .expect("empty session should save");
+        wait_for_next_millisecond();
+        let non_empty = persist_session_via_store(&store, "real conversation");
+
+        // when
+        let latest = store.latest_session().expect("latest should resolve");
+
+        // then — the non-empty session wins; the 0-message one is filtered out
+        assert_eq!(
+            latest.id, non_empty.session_id,
+            "0-message session must be filtered out, non-empty session wins"
+        );
+        assert!(
+            latest.message_count > 0,
+            "resolved session must have messages"
+        );
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn resolve_reference_excluding_latest_skips_excluded_id() {
+        // given — two sessions WITH messages
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("base dir should exist");
+        let store = SessionStore::from_cwd(&base).expect("store should build");
+        let older = persist_session_via_store(&store, "older work");
+        wait_for_next_millisecond();
+        let newer = persist_session_via_store(&store, "newer work");
+
+        // when — resolve the "latest" alias while excluding the newest session
+        let handle = store
+            .resolve_reference_excluding("latest", Some(&newer.session_id))
+            .expect("latest alias excluding newest should resolve");
+
+        // then — the excluded id is skipped, so the older session resolves
+        assert_eq!(
+            handle.id, older.session_id,
+            "excluded id must be skipped when resolving the latest alias"
+        );
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 

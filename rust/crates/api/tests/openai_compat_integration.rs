@@ -159,10 +159,64 @@ async fn send_message_preserves_deepseek_reasoning_content_before_text() {
             },
         ]
     );
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["thinking"], json!({"type": "enabled"}));
 }
 
 #[tokio::test]
-async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params() {
+async fn send_message_preserves_ollama_reasoning_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_ollama_reasoning\",",
+        "\"model\":\"qwen3:latest\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"reasoning\":\"Think locally\",\"content\":\"Answer locally\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("ollama-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "openai/qwen3:latest".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(
+        response.content,
+        vec![
+            OutputContentBlock::Thinking {
+                thinking: "Think locally".to_string(),
+                signature: None,
+            },
+            OutputContentBlock::Text {
+                text: "Answer locally".to_string(),
+            },
+        ]
+    );
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("qwen3:latest"));
+}
+
+#[tokio::test]
+async fn local_openai_gateway_strips_routing_prefix_and_preserves_extra_body_params() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(
         "{",
@@ -206,7 +260,7 @@ async fn custom_openai_gateway_preserves_slash_model_ids_and_extra_body_params()
     let captured = state.lock().await;
     let request = captured.first().expect("captured request");
     let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
-    assert_eq!(body["model"], json!("openai/gpt-4.1-mini"));
+    assert_eq!(body["model"], json!("gpt-4.1-mini"));
     assert_eq!(
         body["web_search_options"],
         json!({"search_context_size": "low"})
@@ -384,6 +438,83 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     assert!(request.body.contains("\"stream\":true"));
 }
 
+#[tokio::test]
+async fn stream_message_preserves_ollama_reasoning_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_stream_ollama_reasoning\",\"model\":\"qwen3:latest\",\"choices\":[{\"delta\":{\"reasoning\":\"Think\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_stream_ollama_reasoning\",\"choices\":[{\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[("x-request-id", "req_ollama_reasoning_stream")],
+        )],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::new("ollama-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&MessageRequest {
+            model: "openai/qwen3:latest".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("stream should start");
+
+    assert_eq!(stream.request_id(), Some("req_ollama_reasoning_stream"));
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 0,
+            content_block: OutputContentBlock::Thinking { .. },
+        })
+    ));
+    assert!(matches!(
+        events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta { .. },
+        })
+    ));
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+    ));
+    assert!(matches!(
+        events[4],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 1,
+            content_block: OutputContentBlock::Text { .. },
+        })
+    ));
+    assert!(matches!(
+        events[5],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 1,
+            delta: ContentBlockDelta::TextDelta { .. },
+        })
+    ));
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("qwen3:latest"));
+    assert_eq!(body["stream"], json!(true));
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn stream_message_retries_retryable_sse_handshake_failures() {
@@ -543,12 +674,13 @@ async fn openai_compatible_client_honors_http_proxy_for_requests() {
         .with_base_url("http://origin.invalid/v1");
     let response = client
         .send_message(&MessageRequest {
-            model: "gpt-4o".to_string(),
+            model: "openai/gpt-4.1-mini".to_string(),
             ..sample_request(false)
         })
         .await
         .expect("proxy should return the OpenAI-compatible response");
 
+    assert_eq!(response.model, "openai/gpt-4.1-mini");
     assert_eq!(response.total_tokens(), 7);
     let captured = state.lock().await;
     let request = captured.first().expect("proxy should capture request");
@@ -557,6 +689,8 @@ async fn openai_compatible_client_honors_http_proxy_for_requests() {
         request.headers.get("authorization").map(String::as_str),
         Some("Bearer openai-test-key")
     );
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("openai/gpt-4.1-mini"));
 }
 
 #[allow(clippy::await_holding_lock)]
